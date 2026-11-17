@@ -1,0 +1,109 @@
+import express from "express";
+import multer from "multer";
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
+import OpenAI from "openai";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const isPdf = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
+    cb(isPdf ? null : new Error("Le fichier doit être un PDF."), isPdf);
+  }
+});
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(path.join(__dirname, "public")));
+
+const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+function requireAI(_req, res, next) {
+  if (!client) return res.status(503).json({ error: "Le service IA n'est pas configuré. Ajoutez OPENAI_API_KEY dans le fichier .env." });
+  next();
+}
+function cleanText(value, max = 14000) {
+  return String(value || "").replace(/\u0000/g, "").trim().slice(0, max);
+}
+
+app.post("/api/parse-cv", upload.single("cv"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Aucun PDF reçu. Sélectionnez un fichier PDF puis réessayez." });
+    const parsed = await pdfParse(req.file.buffer);
+    const text = cleanText(parsed.text, 24000);
+    if (!text) return res.status(422).json({ error: "Aucun texte détecté dans ce PDF. Il s'agit peut-être d'un scan : utilisez un PDF avec texte sélectionnable ou effectuez un OCR." });
+    res.json({ text, pages: parsed.numpages, filename: req.file.originalname });
+  } catch (err) {
+    console.error("PDF parse error:", err);
+    res.status(422).json({ error: "Impossible de lire ce PDF. Vérifiez qu'il n'est pas protégé par mot de passe et qu'il n'est pas endommagé." });
+  }
+});
+
+app.post("/api/analyze-cv", requireAI, async (req, res) => {
+  try {
+    const cv = cleanText(req.body.cv, 18000);
+    const job = cleanText(req.body.job, 300);
+    if (!cv || !job) return res.status(400).json({ error: "CV et poste visé obligatoires." });
+    const response = await client.chat.completions.create({
+      model, response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "Tu es un recruteur expert en France. Analyse uniquement les faits présents dans le CV. Ne fabrique aucune expérience. Réponds en JSON avec les clés: summary (string), strengths (array de strings), gaps (array de strings), questions (array de strings), roleFit (string), pointsToVerify (array de strings). Les questions doivent être ancrées dans les expériences réelles du CV et adaptées au poste." },
+        { role: "user", content: `POSTE VISÉ: ${job}\nCV:\n${cv}` }
+      ],
+      temperature: 0.3
+    });
+    res.json(JSON.parse(response.choices[0].message.content || "{}"));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "L'analyse du CV a échoué. Vérifiez la configuration IA et réessayez." });
+  }
+});
+
+app.post("/api/next-question", requireAI, async (req, res) => {
+  try {
+    const { cv, job, difficulty, recruiter, history, analysis, questionNumber, totalQuestions } = req.body;
+    const safeHistory = Array.isArray(history) ? history.slice(-14).map(x => ({ question: cleanText(x.question, 700), answer: cleanText(x.answer, 2500) })) : [];
+    const response = await client.chat.completions.create({
+      model, response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: `Tu joues un recruteur réaliste en entretien oral en français. Profil recruteur: ${cleanText(recruiter,100)}. Difficulté ${difficulty}/10. Poste: ${cleanText(job,200)}. Pose UNE seule question courte, naturelle, parlée (10-25 mots). Personnalise-la à partir du CV et de l'analyse. Rebonds sur la réponse précédente si pertinent. Attaque avec tact les zones d'ombre du CV. Ne donne aucun conseil et ne révèle pas d'évaluation. Réponds en JSON: {"question":"...","kind":"...","isFinal":false}.` },
+        { role: "user", content: `CV:\n${cleanText(cv,16000)}\nAnalyse:\n${JSON.stringify(analysis || {})}\nQuestions déjà posées et réponses:\n${JSON.stringify(safeHistory)}\nQuestion ${questionNumber} sur ${totalQuestions}.` }
+      ],
+      temperature: 0.7
+    });
+    res.json(JSON.parse(response.choices[0].message.content || "{}"));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Impossible de générer la prochaine question." });
+  }
+});
+
+app.post("/api/debrief", requireAI, async (req, res) => {
+  try {
+    const { cv, job, difficulty, recruiter, history, analysis } = req.body;
+    const response = await client.chat.completions.create({
+      model, response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "Tu es un recruteur exigeant. Évalue honnêtement l'entretien sur 9 critères notés sur 20: accueil, présentation, parcours, auto-évaluation, motivation, STAR, technique, questions pièges, questions candidat. Score global sur 180 = somme des 9 notes. Base-toi uniquement sur les réponses fournies; si un thème n'a pas été abordé, indique non évalué et note prudemment. Donne un verdict Recruté, Short-listé ou Refusé, 3 réponses faibles avec reformulations exactes et réalistes, 2 meilleurs moments, 3 axes prioritaires, une faille CV et comment la défendre, impression en 3 adjectifs. N'invente pas de faits ou de chiffres. JSON avec clés: scores (array d'objets {criterion,score,good,improve}), total (number), verdict, verdictReason, weakAnswers (array d'objets {original,better}), bestMoments (array), impression (array), priorities (array d'objets {axis,method}), cvGap (string), nextObjective (string)." },
+        { role: "user", content: `POSTE: ${job}; DIFFICULTÉ: ${difficulty}/10; RECRUTEUR: ${recruiter}\nCV:\n${cleanText(cv,15000)}\nAnalyse CV:\n${JSON.stringify(analysis || {})}\nENTRETIEN:\n${JSON.stringify(history || [])}` }
+      ],
+      temperature: 0.25
+    });
+    res.json(JSON.parse(response.choices[0].message.content || "{}"));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Le débrief IA n'a pas pu être généré." });
+  }
+});
+
+app.use((err, _req, res, _next) => {
+  if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "Le PDF dépasse la limite de 10 Mo." });
+  res.status(400).json({ error: err.message || "Requête invalide." });
+});
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Interview Studio disponible sur http://localhost:${port}`));
