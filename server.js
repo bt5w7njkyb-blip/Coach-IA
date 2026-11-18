@@ -26,11 +26,21 @@ app.get("/", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const client = process.env.GEMINI_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    })
+  : null;
+
+const model = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 function requireAI(_req, res, next) {
-  if (!client) return res.status(503).json({ error: "Le service IA n'est pas configuré. Ajoutez OPENAI_API_KEY dans le fichier .env." });
+  if (!client) {
+    return res.status(503).json({
+      error: "Le service Gemini n'est pas configuré. Ajoutez GEMINI_API_KEY dans Render."
+    });
+  }
   next();
 }
 function cleanText(value, max = 14000) {
