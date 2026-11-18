@@ -7,28 +7,36 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 dotenv.config();
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const isPdf = file.mimetype === "application/pdf" || file.originalname.toLowerCase().endsWith(".pdf");
+    const isPdf =
+      file.mimetype === "application/pdf" ||
+      file.originalname.toLowerCase().endsWith(".pdf");
+
     cb(isPdf ? null : new Error("Le fichier doit être un PDF."), isPdf);
   }
 });
 
 app.use(express.json({ limit: "1mb" }));
-app.use(express.static(path.join(__dirname, "public")));
 
-app.get("/", (_req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
-});
+app.get("/", (_req, res) =>
+  res.sendFile(path.join(__dirname, "index.html"))
+);
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const client = process.env.GEMINI_API_KEY
   ? new OpenAI({
       apiKey: process.env.GEMINI_API_KEY,
-      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      timeout: 60000,
+      maxRetries: 1
     })
   : null;
 
@@ -44,179 +52,318 @@ function requireAI(_req, res, next) {
 }
 
 function cleanText(value, max = 14000) {
-  return String(value || "").replace(/\u0000/g, "").trim().slice(0, max);
+  return String(value || "")
+    .replace(/\u0000/g, "")
+    .trim()
+    .slice(0, max);
 }
 
+function logTiming(label, startedAt) {
+  console.log(`[TIMING] ${label}: ${Date.now() - startedAt} ms`);
+}
+
+// EXTRACTION DU CV
 app.post("/api/parse-cv", upload.single("cv"), async (req, res) => {
+  const startedAt = Date.now();
+
   try {
     if (!req.file) {
-      return res.status(400).json({ error: "Aucun PDF reçu. Sélectionnez un fichier PDF puis réessayez." });
-    }
-
-    const parsed = await pdfParse(req.file.buffer);
-    const text = cleanText(parsed.text, 24000);
-
-    if (!text) {
-      return res.status(422).json({
-        error: "Aucun texte détecté dans ce PDF. Il s'agit peut-être d'un scan : utilisez un PDF avec texte sélectionnable ou effectuez un OCR."
+      return res.status(400).json({
+        error: "Aucun PDF reçu. Sélectionnez un fichier PDF puis réessayez."
       });
     }
 
-    res.json({ text, pages: parsed.numpages, filename: req.file.originalname });
+    const parsed = await pdfParse(req.file.buffer);
+    const text = cleanText(parsed.text, 16000);
+
+    if (!text) {
+      return res.status(422).json({
+        error: "Aucun texte détecté. Ce PDF est peut-être un scan nécessitant un OCR."
+      });
+    }
+
+    logTiming("PDF extraction", startedAt);
+
+    res.json({
+      text,
+      pages: parsed.numpages,
+      filename: req.file.originalname
+    });
+
   } catch (err) {
     console.error("PDF parse error:", err);
+
     res.status(422).json({
-      error: "Impossible de lire ce PDF. Vérifiez qu'il n'est pas protégé par mot de passe et qu'il n'est pas endommagé."
+      error: "Impossible de lire ce PDF. Vérifiez qu'il n'est pas protégé ou endommagé."
     });
   }
 });
 
-// NOUVEAU : analyse du CV et préparation de la première question en un seul appel IA.
+// ANALYSE DU CV ET PREMIÈRE QUESTION EN UN SEUL APPEL GEMINI
 app.post("/api/start-interview", requireAI, async (req, res) => {
   const startedAt = Date.now();
 
   try {
-    const cv = cleanText(req.body.cv, 12000);
+    const cv = cleanText(req.body.cv, 14000);
     const job = cleanText(req.body.job, 300);
-    const difficulty = Math.min(10, Math.max(1, Number(req.body.difficulty) || 7));
+    const difficulty = cleanText(
+      req.body.difficulty || "Intermédiaire",
+      40
+    );
     const recruiter = cleanText(req.body.recruiter, 100);
 
     if (!cv || !job) {
-      return res.status(400).json({ error: "CV et poste visé obligatoires." });
+      return res.status(400).json({
+        error: "CV et poste visé obligatoires."
+      });
     }
 
     const response = await client.chat.completions.create({
       model,
       response_format: { type: "json_object" },
+      max_tokens: 650,
+      temperature: 0.2,
+
       messages: [
         {
           role: "system",
-          content: `Tu es un recruteur expert en France et tu prépares le début d'un entretien oral. Analyse uniquement les faits présents dans le CV, sans inventer d'expérience. Poste visé : ${job}. Profil recruteur : ${recruiter}. Difficulté : ${difficulty}/10.
+          content: `Tu es un recruteur français.
 
-En une seule réponse JSON, fournis :
-- analysis : objet avec summary (string courte), strengths (3 à 5 éléments), gaps (2 à 4 éléments), questions (3 questions personnalisées), roleFit (string courte), pointsToVerify (array).
-- firstQuestion : UNE seule première question d'entretien, naturelle et orale, de 10 à 25 mots, adaptée au poste et au CV. Elle doit permettre au candidat de commencer à se présenter.
+Prépare le début d'un entretien pour le poste : ${job}.
+Niveau : ${difficulty}.
+Profil recruteur : ${recruiter}.
 
-Réponds uniquement avec ce JSON :
-{"analysis":{"summary":"","strengths":[],"gaps":[],"questions":[],"roleFit":"","pointsToVerify":[]},"firstQuestion":""}.`
+Analyse uniquement les informations du CV.
+N'invente aucune expérience.
+
+Réponds avec un JSON concis contenant :
+- analysis : summary, strengths (3 maximum),
+  gaps (3 maximum), questions (3 maximum),
+  roleFit, pointsToVerify (3 maximum).
+- firstQuestion : une question orale d'ouverture
+  personnalisée de 15 à 25 mots.
+
+Format :
+{"analysis":{"summary":"","strengths":[],"gaps":[],"questions":[],"roleFit":"","pointsToVerify":[]},"firstQuestion":""}`
         },
-        { role: "user", content: `CV DU CANDIDAT :\n${cv}` }
-      ],
-      temperature: 0.3
+        {
+          role: "user",
+          content: `CV :\n${cv}`
+        }
+      ]
     });
 
-    const result = JSON.parse(response.choices[0].message.content || "{}");
+    const result = JSON.parse(
+      response.choices?.[0]?.message?.content || "{}"
+    );
 
     if (!result.analysis || !result.firstQuestion) {
-      throw new Error("Réponse IA incomplète lors de la préparation de l'entretien.");
+      throw new Error("Réponse IA incomplète.");
     }
 
-    console.log(`Interview start prepared in ${Date.now() - startedAt} ms`);
+    logTiming("Combined CV analysis + first question", startedAt);
+
     res.json(result);
+
   } catch (err) {
     console.error("Interview start error:", err);
+
     res.status(500).json({
-      error: "La préparation de l'entretien a échoué. Vérifiez les logs Render et réessayez."
+      error: "La préparation a échoué. Consultez les logs Render."
     });
   }
 });
 
-app.post("/api/analyze-cv", requireAI, async (req, res) => {
-  try {
-    const cv = cleanText(req.body.cv, 18000);
-    const job = cleanText(req.body.job, 300);
-
-    if (!cv || !job) {
-      return res.status(400).json({ error: "CV et poste visé obligatoires." });
-    }
-
-    const response = await client.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: "Tu es un recruteur expert en France. Analyse uniquement les faits présents dans le CV. Ne fabrique aucune expérience. Réponds en JSON avec les clés: summary (string), strengths (array de strings), gaps (array de strings), questions (array de strings), roleFit (string), pointsToVerify (array de strings). Les questions doivent être ancrées dans les expériences réelles du CV et adaptées au poste."
-        },
-        { role: "user", content: `POSTE VISÉ: ${job}\nCV:\n${cv}` }
-      ],
-      temperature: 0.3
-    });
-
-    res.json(JSON.parse(response.choices[0].message.content || "{}"));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "L'analyse du CV a échoué. Vérifiez la configuration IA et réessayez." });
-  }
-});
-
+// GÉNÉRATION DES QUESTIONS SUIVANTES
 app.post("/api/next-question", requireAI, async (req, res) => {
-  try {
-    const { cv, job, difficulty, recruiter, history, analysis, questionNumber, totalQuestions } = req.body;
+  const startedAt = Date.now();
 
-    const safeHistory = Array.isArray(history)
-      ? history.slice(-14).map(x => ({
-          question: cleanText(x.question, 700),
-          answer: cleanText(x.answer, 2500)
+  try {
+    const job = cleanText(req.body.job, 250);
+    const difficulty = cleanText(
+      req.body.difficulty || "Intermédiaire",
+      40
+    );
+    const recruiter = cleanText(req.body.recruiter, 100);
+
+    const analysis =
+      req.body.analysis && typeof req.body.analysis === "object"
+        ? req.body.analysis
+        : {};
+
+    const history = Array.isArray(req.body.history)
+      ? req.body.history.slice(-5).map(x => ({
+          question: cleanText(x.question, 400),
+          answer: cleanText(x.answer, 1200)
         }))
       : [];
 
     const response = await client.chat.completions.create({
       model,
       response_format: { type: "json_object" },
+      max_tokens: 220,
+      temperature: 0.5,
+
       messages: [
         {
           role: "system",
-          content: `Tu joues un recruteur réaliste en entretien oral en français. Profil recruteur: ${cleanText(recruiter,100)}. Difficulté ${difficulty}/10. Poste: ${cleanText(job,200)}. Pose UNE seule question courte, naturelle, parlée (10-25 mots). Personnalise-la à partir du CV et de l'analyse. Rebonds sur la réponse précédente si pertinent. Attaque avec tact les zones d'ombre du CV. Ne donne aucun conseil et ne révèle pas d'évaluation. Réponds en JSON: {"question":"...","kind":"...","isFinal":false}.`
+          content: `Tu es un recruteur français pour le poste ${job}.
+Niveau : ${difficulty}.
+Profil : ${recruiter}.
+
+Pose UNE seule question orale, naturelle et courte
+(10 à 25 mots).
+
+Appuie-toi sur l'analyse du CV et les réponses précédentes.
+Fais progresser l'entretien.
+Varie les thèmes et rebondis sur la dernière réponse.
+Ne donne aucun conseil ni évaluation.
+
+JSON strict :
+{"question":"...","kind":"...","isFinal":false}.`
         },
         {
           role: "user",
-          content: `CV:\n${cleanText(cv,16000)}\nAnalyse:\n${JSON.stringify(analysis || {})}\nQuestions déjà posées et réponses:\n${JSON.stringify(safeHistory)}\nQuestion ${questionNumber} sur ${totalQuestions}.`
+          content: `ANALYSE DU CV : ${JSON.stringify(analysis)}
+DERNIÈRES QUESTIONS/RÉPONSES : ${JSON.stringify(history)}
+Question ${Number(req.body.questionNumber) || 2}
+sur ${Number(req.body.totalQuestions) || 10}.`
         }
-      ],
-      temperature: 0.7
+      ]
     });
 
-    res.json(JSON.parse(response.choices[0].message.content || "{}"));
+    const result = JSON.parse(
+      response.choices?.[0]?.message?.content || "{}"
+    );
+
+    if (!result.question) {
+      throw new Error("Question vide reçue de Gemini.");
+    }
+
+    logTiming("Next interview question", startedAt);
+    res.json(result);
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Impossible de générer la prochaine question." });
+    console.error("Next question error:", err);
+
+    res.status(500).json({
+      error: "Impossible de générer la prochaine question. Consultez les logs Render."
+    });
   }
 });
 
+// DÉBRIEF FINAL
 app.post("/api/debrief", requireAI, async (req, res) => {
+  const startedAt = Date.now();
+
   try {
-    const { cv, job, difficulty, recruiter, history, analysis } = req.body;
+    const cv = cleanText(req.body.cv, 12000);
+    const job = cleanText(req.body.job, 250);
+    const difficulty = cleanText(
+      req.body.difficulty || "Intermédiaire",
+      40
+    );
+    const recruiter = cleanText(req.body.recruiter, 100);
+
+    const history = Array.isArray(req.body.history)
+      ? req.body.history.slice(0, 12)
+      : [];
+
+    const analysis = req.body.analysis || {};
 
     const response = await client.chat.completions.create({
       model,
       response_format: { type: "json_object" },
+      max_tokens: 1800,
+      temperature: 0.2,
+
       messages: [
         {
           role: "system",
-          content: "Tu es un recruteur exigeant. Évalue honnêtement l'entretien sur 9 critères notés sur 20: accueil, présentation, parcours, auto-évaluation, motivation, STAR, technique, questions pièges, questions candidat. Score global sur 180 = somme des 9 notes. Base-toi uniquement sur les réponses fournies; si un thème n'a pas été abordé, indique non évalué et note prudemment. Donne un verdict Recruté, Short-listé ou Refusé, 3 réponses faibles avec reformulations exactes et réalistes, 2 meilleurs moments, 3 axes prioritaires, une faille CV et comment la défendre, impression en 3 adjectifs. N'invente pas de faits ou de chiffres. JSON avec clés: scores (array d'objets {criterion,score,good,improve}), total (number), verdict, verdictReason, weakAnswers (array d'objets {original,better}), bestMoments (array), impression (array), priorities (array d'objets {axis,method}), cvGap (string), nextObjective (string)."
+          content: `Tu es un recruteur exigeant.
+
+Évalue l'entretien sur 9 critères notés sur 20 :
+accueil, présentation, parcours, auto-évaluation,
+motivation, STAR, technique, questions pièges,
+questions candidat.
+
+Le total est sur 180.
+
+Base-toi uniquement sur les réponses.
+Si un thème n'a pas été abordé, note prudemment.
+
+Donne :
+- Un verdict : Recruté, Short-listé ou Refusé.
+- 3 réponses faibles avec reformulations.
+- 2 meilleurs moments.
+- 3 priorités.
+- Une faille CV et comment la défendre.
+- Une impression en 3 adjectifs.
+
+N'invente rien.
+
+JSON avec clés :
+scores (array {criterion,score,good,improve}),
+total, verdict, verdictReason,
+weakAnswers (array {original,better}),
+bestMoments, impression,
+priorities (array {axis,method}),
+cvGap, nextObjective.`
         },
         {
           role: "user",
-          content: `POSTE: ${job}; DIFFICULTÉ: ${difficulty}/10; RECRUTEUR: ${recruiter}\nCV:\n${cleanText(cv,15000)}\nAnalyse CV:\n${JSON.stringify(analysis || {})}\nENTRETIEN:\n${JSON.stringify(history || [])}`
+          content: `POSTE : ${job}.
+NIVEAU : ${difficulty}.
+RECRUTEUR : ${recruiter}.
+
+CV :
+${cv}
+
+ANALYSE :
+${JSON.stringify(analysis)}
+
+ENTRETIEN :
+${JSON.stringify(history)}`
         }
-      ],
-      temperature: 0.25
+      ]
     });
 
-    res.json(JSON.parse(response.choices[0].message.content || "{}"));
+    const result = JSON.parse(
+      response.choices?.[0]?.message?.content || "{}"
+    );
+
+    logTiming("Interview debrief", startedAt);
+    res.json(result);
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Le débrief IA n'a pas pu être généré." });
+    console.error("Debrief error:", err);
+
+    res.status(500).json({
+      error: "Le débrief IA n'a pas pu être généré. Consultez les logs Render."
+    });
   }
 });
 
+// GESTION DES ERREURS
 app.use((err, _req, res, _next) => {
-  if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({ error: "Le PDF dépasse la limite de 10 Mo." });
+  if (
+    err instanceof multer.MulterError &&
+    err.code === "LIMIT_FILE_SIZE"
+  ) {
+    return res.status(413).json({
+      error: "Le PDF dépasse la limite de 10 Mo."
+    });
   }
-  res.status(400).json({ error: err.message || "Requête invalide." });
+
+  res.status(400).json({
+    error: err.message || "Requête invalide."
+  });
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Training Coach IA disponible sur http://localhost:${port}`));
+
+app.listen(port, () => {
+  console.log(
+    `Training Coach IA démarré sur le port ${port} · modèle ${model}`
+  );
+});
