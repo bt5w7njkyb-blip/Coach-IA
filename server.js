@@ -122,7 +122,6 @@ app.post("/api/start-interview", requireAI, async (req, res) => {
       model,
       response_format: { type: "json_object" },
       max_tokens: 650,
-      temperature: 0.2,
 
       messages: [
         {
@@ -202,7 +201,7 @@ app.post("/api/next-question", requireAI, async (req, res) => {
       model,
       response_format: { type: "json_object" },
       max_tokens: 220,
-      temperature: 0.5,
+
 
       messages: [
         {
@@ -275,7 +274,6 @@ app.post("/api/debrief", requireAI, async (req, res) => {
       model,
       response_format: { type: "json_object" },
       max_tokens: 1800,
-      temperature: 0.2,
 
       messages: [
         {
